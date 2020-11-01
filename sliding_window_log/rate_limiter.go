@@ -19,15 +19,16 @@
 ** LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 ** OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ****************************************************************************/
+// Package sliding_window_log provides a rate limiter implemented by
+// sliding window log algorithm.
+package sliding_window_log
 
-// Package fixed_window_counter provides a rate limiter implemented by
-// fixed window counter algorithm.
-package fixed_window_counter
 
 import (
 	"context"
 	"math"
 	"time"
+	"fmt"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -75,62 +76,49 @@ func NewRateLimiter(client *redis.Client, limit Limit, actionKey string, period 
 // Use this method if you intend to drop / skip action that exceed the rate limit.
 // Otherwise use Wait.
 func (limiter *RateLimiter) Allow(ctx context.Context) bool {
-	// TODO: The next three line should be an atomic operation. (Use LUA script maybe.)
-	// INCR: Increments the number stored at key by one. If the key does not exist,
-	// it is set to 0 before performing the operation.
-	result, err := limiter.innerRedis.Incr(ctx, limiter.actionKey).Result()
-	if err == nil && result == 1 { // set a expire time at first time.
-		limiter.innerRedis.Expire(ctx, limiter.actionKey, limiter.period)
+	// TODO: the ZRemRangeByScore, ZCard should be atomic operations, otherwise
+	// the Allow might allow actions happend more than limiting rate.  
+	// remove expired log                   
+	timestamp := time.Now().UnixNano()
+	_, err := limiter.innerRedis.ZRemRangeByScore(ctx, limiter.actionKey, 
+		"-inf", fmt.Sprintf("%v", timestamp-limiter.period.Nanoseconds())).Result()
+	if err != nil { // something wrong with actionKey.
+		limiter.innerRedis.Del(ctx, limiter.actionKey)
+		return true
 	}
 
-	if err != nil || result >= int64(limiter.limit) {
-		// check if Expire was failed.
-		ttl, err := limiter.innerRedis.TTL(ctx, limiter.actionKey).Result()
-		if ttl < 0 || err != nil {
-			limiter.innerRedis.Del(ctx, limiter.actionKey)
-			return true
-		}
-
-		// up to limit
+	wndSize, _ := limiter.innerRedis.ZCard(ctx, limiter.actionKey).Result()
+	if Limit(wndSize) > limiter.limit {
 		return false
 	}
 
+	_, err = limiter.innerRedis.ZAdd(ctx, limiter.actionKey, 
+		&redis.Z{float64(timestamp), timestamp}).Result()
+	if err != nil {
+		return false
+	}
+
+	// avoid cold data
+	limiter.innerRedis.Expire(ctx, limiter.actionKey, limiter.period+time.Second)
 	return true
 }
 
 // Wait reports whether the action exceed the rate limit.
 func (limiter *RateLimiter) Wait(ctx context.Context) bool {
-	// Check if ctx is already cancelled
-	select {
-	case <-ctx.Done():
-		return false
-	default:
-	}
-
 	for {
+		// Check if ctx is already cancelled
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
 		if limiter.Allow(ctx) {
 			return true
 		}
 
-		// Allow failed, wait for actionKey to expire.
-		ttl, err := limiter.innerRedis.TTL(ctx, limiter.actionKey).Result()
-		// Try again if Expire was failed
-		if ttl < 0 || err != nil {
-			continue
-		}
-		
-		timer := time.NewTimer(ttl)
-
-		select {
-		case <-timer.C:
-			// actionKey expired, keep trying...
-			timer.Stop()
-		case <-ctx.Done():
-			// Context was canceled before we could proceed.
-			timer.Stop()
-			return false
-		}
+		// Allow failed, wait for actions to expire.
+		limiter.innerRedis.BZPopMin(ctx, limiter.period, limiter.actionKey)
 	}
-
 	return true
 }

@@ -20,10 +20,10 @@
 ** OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ****************************************************************************/
 
-// Package fixed_window_counter provides a rate limiter implemented by
-// fixed window counter algorithm.
-// test for fixed window counter algorithm.
-package fixed_window_counter
+// Package sliding_window_log provides a rate limiter implemented by
+// sliding window log algorithm.
+// test for sliding window log algorithm.
+package sliding_window_log
 
 import (
 	"context"
@@ -37,8 +37,8 @@ import (
 )
 
 const (
-	allowMetricsKey = "TestRateLimiterAllow:FWC"
-	waitMetricsKey  = "TestRateLimiterWait:FWC"
+	allowMetricsKey = "TestRateLimiterAllow:SWL"
+	waitMetricsKey  = "TestRateLimiterWait:SWL"
 )
 
 func init() {
@@ -86,7 +86,7 @@ func testRateLimiterWait(t *testing.T) {
 	fmt.Println("TestRateLimiterWait")
 	defer fmt.Println("TestRateLimiterWait End")
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*200)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60*10)
     defer cancel() 
 
 	innerRedis := redis.NewClient(&redis.Options{
@@ -100,10 +100,16 @@ func testRateLimiterWait(t *testing.T) {
 	metrics.Register(waitMetricsKey, counter)
 
 	limiter := NewRateLimiter(innerRedis, 1000, "counter:"+waitMetricsKey, time.Second*60)
+	limiterRef := NewRateLimiter(innerRedis, 15, "counterRef:"+waitMetricsKey, time.Second*2)
+	start := time.Now()
 
 	for {
 		if limiter.Wait(ctx) {
-			go counter.Inc(1)
+			if time.Since(start) < time.Second * 60 && limiterRef.Wait(ctx) {
+				go counter.Inc(1)
+			} else {
+				go counter.Inc(1)
+			}
 		} else {
 			break
 		}
