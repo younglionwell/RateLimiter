@@ -21,9 +21,9 @@
 ****************************************************************************/
 
 // Package fixed_window_counter provides a rate limiter implemented by
-// fixed window counter algorithm.
-// test for fixed window counter algorithm.
-package fixed_window_counter
+// sliding window counter algorithm.
+// test for sliding window counter algorithm.
+package sliding_window_counter
 
 import (
 	"context"
@@ -37,8 +37,8 @@ import (
 )
 
 const (
-	allowMetricsKey = "TestRateLimiterAllow:FWC"
-	waitMetricsKey  = "TestRateLimiterWait:FWC"
+	allowMetricsKey = "TestRateLimiterAllow:SWC"
+	waitMetricsKey  = "TestRateLimiterWait:SWC"
 )
 
 func init() {
@@ -51,7 +51,7 @@ func init() {
 		"", true)
 }
 
-func TestRateLimiter(t *testing.T) { 
+func TestRateLimiter(t *testing.T) {
 	go testRateLimiterWait(t)
 	testRateLimiterAllow(t)
 }
@@ -59,7 +59,7 @@ func TestRateLimiter(t *testing.T) {
 func testRateLimiterAllow(t *testing.T) {
 	fmt.Println("TestRateLimiterAllow")
 	defer fmt.Println("TestRateLimiterAllow End")
-	
+
 	ctx := context.Background()
 	innerRedis := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
@@ -71,7 +71,7 @@ func testRateLimiterAllow(t *testing.T) {
 	counter := metrics.NewCounter()
 	metrics.Register(allowMetricsKey, counter)
 
-	limiter := NewRateLimiter(innerRedis, 1000, "counter:"+allowMetricsKey, time.Second*60)
+	limiter := NewRateLimiter(innerRedis, 1000, "counter:"+allowMetricsKey, time.Second*60, time.Millisecond)
 
 	for {
 		if limiter.Allow(ctx) {
@@ -86,8 +86,8 @@ func testRateLimiterWait(t *testing.T) {
 	fmt.Println("TestRateLimiterWait")
 	defer fmt.Println("TestRateLimiterWait End")
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*200)
-    defer cancel() 
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60*10)
+	defer cancel()
 
 	innerRedis := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
@@ -99,8 +99,8 @@ func testRateLimiterWait(t *testing.T) {
 	counter := metrics.NewCounter()
 	metrics.Register(waitMetricsKey, counter)
 
-	limiter := NewRateLimiter(innerRedis, 1000, "counter:"+waitMetricsKey, time.Second*60)
-	limiterRef := NewRateLimiter(innerRedis, 15, "counterRef:"+waitMetricsKey, time.Second)
+	limiter := NewRateLimiter(innerRedis, 1000, "counter:"+waitMetricsKey, time.Second*60, time.Millisecond)
+	limiterRef := NewRateLimiter(innerRedis, 15, "counterRef:"+waitMetricsKey, time.Second, time.Millisecond)
 	start := time.Now()
 
 	for {

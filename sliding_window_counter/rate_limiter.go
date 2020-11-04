@@ -19,16 +19,16 @@
 ** LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 ** OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ****************************************************************************/
-// Package sliding_window_log provides a rate limiter implemented by
-// sliding window log algorithm.
-package sliding_window_log
 
+// Package fixed_window_counter provides a rate limiter implemented by
+// sliding window counter algorithm.
+package sliding_window_counter
 
 import (
 	"context"
 	"math"
+	"strconv"
 	"time"
-	"fmt"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -55,20 +55,28 @@ const Inf = Limit(math.MaxInt64)
 type RateLimiter struct {
 	actionKey string
 	// the action only happends limit times in a period time.
-	period time.Duration
-	limit  Limit
+	period   time.Duration
+	limit    Limit
+	// the interval time between two window counter
+	interval time.Duration
 
 	innerRedis *redis.Client
 }
 
+func (limiter *RateLimiter) getFiledKey(cur time.Time) string {
+	return strconv.FormatInt(cur.UnixNano() / limiter.interval.Nanoseconds(), 10)
+}
+
 // NewRateLimiter returns a new RateLimiter that allows the action up to happening
 // limit times in a period time.
-func NewRateLimiter(client *redis.Client, limit Limit, actionKey string, period time.Duration) *RateLimiter {
+func NewRateLimiter(client *redis.Client, limit Limit, actionKey string, period time.Duration,
+	interval time.Duration) *RateLimiter {
 	return &RateLimiter{
 		innerRedis: client,
 		limit:      limit,
 		actionKey:  actionKey,
 		period:     period,
+		interval:   interval,
 	}
 }
 
@@ -76,30 +84,40 @@ func NewRateLimiter(client *redis.Client, limit Limit, actionKey string, period 
 // Use this method if you intend to drop / skip action that exceed the rate limit.
 // Otherwise use Wait.
 func (limiter *RateLimiter) Allow(ctx context.Context) bool {
-	// TODO: the ZRemRangeByScore, ZCard should be atomic operations, otherwise
-	// the Allow might allow actions happend more than limiting rate.  
-	// remove expired log                   
-	timestamp := time.Now().UnixNano()
-	_, err := limiter.innerRedis.ZRemRangeByScore(ctx, limiter.actionKey,
-		"-inf", fmt.Sprintf("%v", timestamp-limiter.period.Nanoseconds())).Result()
+	// remove expired counter
+	// Should be an atomic operation. (Use LUA script maybe.)
+	result, err := limiter.innerRedis.HGetAll(ctx, limiter.actionKey).Result()
 	if err != nil { // something wrong with actionKey.
 		limiter.innerRedis.Del(ctx, limiter.actionKey)
 		return true
 	}
 
-	wndSize, _ := limiter.innerRedis.ZCard(ctx, limiter.actionKey).Result()
+	// delete expire keys
+	timestamp := time.Now().UnixNano() / limiter.interval.Nanoseconds()
+	var delKey []string
+	wndSize := int64(0)
+	for k, v := range result {
+		ik, _ := strconv.ParseInt(k, 10, 64)
+		iv, _ := strconv.ParseInt(v, 10, 64)
+		if ik <= timestamp {
+			delKey = append(delKey, k)
+		} else {
+			wndSize += iv
+		}
+	}
+	limiter.innerRedis.HDel(ctx, limiter.actionKey, delKey...)
+
+	// check if up to limit
 	if Limit(wndSize) >= limiter.limit {
 		return false
 	}
 
-	_, err = limiter.innerRedis.ZAdd(ctx, limiter.actionKey, 
-		&redis.Z{float64(timestamp), timestamp}).Result()
-	if err != nil {
-		return false
-	}
+	// add for new action
+	limiter.innerRedis.HIncrBy(ctx, limiter.actionKey, limiter.getFiledKey(time.Now().Add(limiter.period)), 1)
 
 	// avoid cold data
 	limiter.innerRedis.Expire(ctx, limiter.actionKey, limiter.period+time.Second)
+
 	return true
 }
 
@@ -117,19 +135,8 @@ func (limiter *RateLimiter) Wait(ctx context.Context) bool {
 			return true
 		}
 
-		// Allow failed, wait for first log in zset to expire.
-		// ZRANGE: Returns the specified range of elements in the sorted set stored at key.
-		// The elements are considered to be ordered from the lowest to the highest score.
-		// Lexicographical order is used for elements with equal score.
-		result, err := limiter.innerRedis.ZRangeWithScores(ctx, limiter.actionKey, 0, 0).Result()
-		if err != nil || len(result) == 0{
-			continue
-		}
-		ttl := limiter.period.Nanoseconds()-(time.Now().UnixNano()-int64(result[0].Score)) - 1
-		if ttl <= 0 {
-			continue
-		}
-		timer := time.NewTimer(time.Duration(ttl) * time.Nanosecond)
+		// Allow failed, wait for limiter.interval
+		timer := time.NewTimer(limiter.interval)
 
 		select {
 		case <-timer.C:

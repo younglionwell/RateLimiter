@@ -100,12 +100,12 @@ func testRateLimiterWait(t *testing.T) {
 	metrics.Register(waitMetricsKey, counter)
 
 	limiter := NewRateLimiter(innerRedis, 1000, "counter:"+waitMetricsKey, time.Second*60)
-	limiterRef := NewRateLimiter(innerRedis, 15, "counterRef:"+waitMetricsKey, time.Second*2)
+	limiterRef := NewRateLimiter(innerRedis, 15, "counterRef:"+waitMetricsKey, time.Second)
 	start := time.Now()
 
 	for {
 		if limiter.Wait(ctx) {
-			if time.Since(start) < time.Second * 60 && limiterRef.Wait(ctx) {
+			if time.Since(start) < time.Second * 60 * 2 && limiterRef.Wait(ctx) {
 				go counter.Inc(1)
 			} else {
 				go counter.Inc(1)
